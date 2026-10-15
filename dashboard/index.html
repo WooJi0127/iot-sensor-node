@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>智慧环境监测终端 · 实时看板</title>
+<style>
+  :root {
+    --bg: #0f172a; --panel: #1e293b; --panel2: #273449;
+    --text: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8;
+    --temp: #fb7185; --hum: #34d399; --lux: #fbbf24;
+    --warn: #f87171; --ok: #22c55e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: radial-gradient(1200px 600px at 70% -10%, #1e293b, var(--bg));
+    color: var(--text); min-height: 100vh; padding: 24px;
+  }
+  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; flex-wrap: wrap; gap: 12px; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: .5px; }
+  .sub { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  .status { font-size: 13px; display: flex; align-items: center; gap: 8px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+  .dot.on { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 20px; }
+  .card { background: var(--panel); border: 1px solid var(--panel2); border-radius: 14px; padding: 16px; position: relative; }
+  .card h3 { margin: 0 0 10px; font-size: 15px; }
+  .metric { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px dashed #334155; font-size: 14px; }
+  .metric:last-child { border-bottom: none; }
+  .metric b { font-variant-numeric: tabular-nums; }
+  .badge { position: absolute; top: 14px; right: 14px; font-size: 11px; padding: 3px 8px; border-radius: 999px; }
+  .badge.ok { background: rgba(34,197,94,.15); color: var(--ok); }
+  .badge.warn { background: rgba(248,113,113,.18); color: var(--warn); }
+  .panel { background: var(--panel); border: 1px solid var(--panel2); border-radius: 14px; padding: 16px; }
+  .toolbar { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+  .btn { background: var(--panel2); color: var(--text); border: 1px solid #334155; border-radius: 8px; padding: 6px 14px; cursor: pointer; font-size: 13px; }
+  .btn.active { background: var(--accent); color: #04263b; border-color: var(--accent); font-weight: 600; }
+  canvas { width: 100%; height: 320px; display: block; }
+  .legend { display: flex; gap: 16px; margin-top: 10px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+  .legend i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+  footer { color: var(--muted); font-size: 12px; margin-top: 18px; }
+  code { background: #0b1220; padding: 2px 6px; border-radius: 5px; color: #7dd3fc; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>🌱 智慧环境监测终端</h1>
+    <div class="sub">iot-sensor-node · 实时传感器看板（SSE 推送，零依赖）</div>
+  </div>
+  <div class="status"><span id="dot" class="dot"></span><span id="statusText">连接中…</span></div>
+</header>
+
+<div class="cards" id="cards"></div>
+
+<div class="panel">
+  <div class="toolbar">
+    <span style="font-size:13px;color:var(--muted);align-self:center;">指标：</span>
+    <button class="btn active" data-m="temp">温度 (°C)</button>
+    <button class="btn" data-m="hum">湿度 (%)</button>
+    <button class="btn" data-m="lux">光照 (lux)</button>
+  </div>
+  <canvas id="chart"></canvas>
+  <div class="legend" id="legend"></div>
+</div>
+
+<footer>
+  数据由 <code>/stream</code> (SSE) 实时推送；异常帧由模拟器注入，红点提示。
+  对接异常检测见 <a href="https://github.com" style="color:var(--accent)">edge-anomaly-llm</a>。
+</footer>
+
+<script>
+const COLORS = { temp: getCSS('--temp'), hum: getCSS('--hum'), lux: getCSS('--lux') };
+function getCSS(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+const MAXPTS = 120;
+let metric = 'temp';
+const state = {};   // id -> {name, hist:{temp,hum,lux}, last, anomaly}
+const nodes = {};
+
+// 拉取节点列表与初始快照
+async function init() {
+  const n = await (await fetch('/nodes')).json();
+  n.forEach(x => { nodes[x.id] = x; state[x.id] = {name:x.name, hist:{temp:[],hum:[],lux:[]}, last:null, anomaly:false}; });
+  const latest = await (await fetch('/latest')).json();
+  latest.forEach(ingest);
+  renderCards(); buildLegend();
+  connectSSE();
+}
+
+function ingest(r){
+  const s = state[r.id]; if(!s) return;
+  s.name = r.name; s.last = r; s.anomaly = r.anomaly;
+  for(const k of ['temp','hum','lux']){
+    s.hist[k].push(r[k]);
+    if(s.hist[k].length > MAXPTS) s.hist[k].shift();
+  }
+}
+
+function connectSSE(){
+  const es = new EventSource('/stream');
+  es.onopen = () => setStatus(true);
+  es.onerror = () => setStatus(false);
+  es.onmessage = (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      if(Array.isArray(data)) data.forEach(ingest); else ingest(data);
+      renderCards(); draw();
+    } catch(_) {}
+  };
+}
+
+function setStatus(on){
+  document.getElementById('dot').className = 'dot' + (on ? ' on' : '');
+  document.getElementById('statusText').textContent = on ? '已连接' : '断开，重连中…';
+}
+
+function renderCards(){
+  const wrap = document.getElementById('cards');
+  wrap.innerHTML = '';
+  for(const id in state){
+    const s = state[id]; const r = s.last || {};
+    const badge = s.anomaly ? '<span class="badge warn">异常</span>' : '<span class="badge ok">正常</span>';
+    wrap.insertAdjacentHTML('beforeend', `
+      <div class="card">
+        ${badge}
+        <h3>${s.name} <span style="color:var(--muted);font-size:12px;">${id}</span></h3>
+        <div class="metric"><span>🌡 温度</span><b style="color:var(--temp)">${r.temp ?? '—'}</b></div>
+        <div class="metric"><span>💧 湿度</span><b style="color:var(--hum)">${r.hum ?? '—'}</b></div>
+        <div class="metric"><span>☀ 光照</span><b style="color:var(--lux)">${r.lux ?? '—'}</b></div>
+      </div>`);
+  }
+}
+
+function buildLegend(){
+  const el = document.getElementById('legend');
+  el.innerHTML = Object.keys(state).map(id =>
+    `<span><i style="background:${COLORS[metric]}"></i>${state[id].name} (${id})</span>`).join('');
+}
+
+const canvas = document.getElementById('chart');
+const ctx = canvas.getContext('2d');
+function resize(){ const r=canvas.getBoundingClientRect(); canvas.width=r.width*2; canvas.height=320*2; ctx.scale(2,2); }
+window.addEventListener('resize', ()=>{ resize(); draw(); }); resize();
+
+function draw(){
+  const W = canvas.width/2, H = canvas.height/2;
+  ctx.clearRect(0,0,W,H);
+  const ids = Object.keys(state);
+  if(!ids.length) return;
+  // 计算纵轴范围
+  let lo=Infinity, hi=-Infinity;
+  ids.forEach(id => state[id].hist[metric].forEach(v => { if(v<lo)lo=v; if(v>hi)hi=v; }));
+  if(!isFinite(lo)){ lo=0; hi=1; }
+  const pad=(hi-lo)*0.15 || 1; lo-=pad; hi+=pad;
+  // 网格
+  ctx.strokeStyle='#334155'; ctx.lineWidth=1; ctx.fillStyle='#64748b'; ctx.font='11px sans-serif';
+  for(let i=0;i<=4;i++){ const y=20+(H-40)*i/4; ctx.beginPath(); ctx.moveTo(40,y); ctx.lineTo(W-10,y); ctx.stroke(); ctx.fillText((hi-(hi-lo)*i/4).toFixed(1), 4, y+3); }
+  // 折线
+  ids.forEach(id=>{
+    const h=state[id].hist[metric]; if(h.length<2) return;
+    ctx.strokeStyle=COLORS[metric]; ctx.lineWidth=2; ctx.beginPath();
+    h.forEach((v,i)=>{ const x=40+(W-50)*i/(MAXPTS-1); const y=20+(H-40)*(1-(v-lo)/(hi-lo)); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+    ctx.stroke();
+  });
+  ctx.fillStyle='#94a3b8'; ctx.font='12px sans-serif';
+  ctx.fillText({temp:'温度 °C',hum:'湿度 %',lux:'光照 lux'}[metric], 42, 16);
+}
+
+document.querySelectorAll('.btn').forEach(b=>{
+  b.onclick=()=>{ document.querySelectorAll('.btn').forEach(x=>x.classList.remove('active')); b.classList.add('active'); metric=b.dataset.m; buildLegend(); draw(); };
+});
+
+init();
+</script>
+</body>
+</html>

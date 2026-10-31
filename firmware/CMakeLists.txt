@@ -1,26 +1,26 @@
-# CMakeLists.txt — STM32 (STM32Cube + arm-none-eabi) 构建参考
-# 依赖：ARM GCC toolchain、CMSIS、HAL 库（按芯片型号替换）
 cmake_minimum_required(VERSION 3.20)
-project(iot_sensor_node C CXX ASM)
+project(iot_sensor_node C)
+option(PC_BUILD "Build host protocol demo; board support is reference-only" OFF)
 
-set(MCU cortex-m4)
-set(CMAKE_C_FLAGS "-mcpu=${MCU} -mthumb -O2 -Wall")
-set(CMAKE_EXE_LINKER_FLAGS "-T${CMAKE_SOURCE_DIR}/STM32F4xx_FLASH.ld")
-
-add_executable(node.elf
-    main.c
-    sensor.c
-    sensor.h
-    protocol.c
-    protocol.h
-    mqtt_at.c
-    mqtt_at.h
-)
-
-# PC 联调（验证协议/与上位机对接，无需硬件）：
-#   mkdir build && cd build && cmake -DPC_BUILD=ON .. && make
-option(PC_BUILD "Build for host (protocol/uart sanity check)" OFF)
+add_executable(node main.c sensor.c protocol.c mqtt_at.c)
+set_target_properties(node PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
 if(PC_BUILD)
-    target_compile_definitions(node.elf PRIVATE PC_BUILD)
-    target_link_libraries(node.elf m)
+    target_compile_definitions(node PRIVATE PC_BUILD)
+    add_executable(protocol_check ../tests/protocol_check.c protocol.c)
+    target_include_directories(protocol_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(protocol_check PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+    foreach(target node protocol_check)
+        if(MSVC)
+            target_compile_options(${target} PRIVATE /W4 /utf-8)
+            target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
+        else()
+            target_compile_options(${target} PRIVATE -Wall -Wextra -Werror)
+            target_link_libraries(${target} PRIVATE m)
+        endif()
+    endforeach()
+    if(NOT WIN32)
+        set_target_properties(node PROPERTIES SUFFIX ".elf")
+    endif()
+else()
+    message(FATAL_ERROR "Hardware is a reference skeleton. Supply HAL/CMSIS, drivers, RTC and linker configuration in your board project; use -DPC_BUILD=ON for the verified host demo.")
 endif()

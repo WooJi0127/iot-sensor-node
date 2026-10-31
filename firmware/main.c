@@ -1,89 +1,83 @@
-/*
- * main.c — 智慧环境监测终端固件（STM32 + FreeRTOS 参考实现）
- *
- * 数据流：传感器采集 -> 组帧 -> 通过 ESP-AT(MQTT) 或 UART 上报
- * 与 simulator/sensor_sim.py 共用 protocol.h 的帧格式。
- *
- * 编译（PC 联调桩，验证协议与上位机对接）：
- *   gcc main.c sensor.c mqtt_at.c -o node_demo -DPC_BUILD
- * 烧录（真实板子）：
- *   arm-none-eabi-gcc + OpenOCD / STM32CubeProgrammer
- */
+/* Reference acquisition loop. PC_BUILD validates JSON only, with no MQTT network. */
+#if defined(PC_BUILD) && !defined(_WIN32)
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "protocol.h"
 #include "sensor.h"
 #include "mqtt_at.h"
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <time.h>
-
 #ifdef PC_BUILD
-/* PC 联调：用标准库实现一个最小 mqtt_at 桩 */
-bool mqtt_connect(const char *ssid, const char *psk, const char *broker, int port)
-{ (void)ssid;(void)psk;(void)broker;(void)port; return true; }
-bool mqtt_publish_frame(const sensor_frame_t *f)
-{ char buf[160]; frame_to_json(f, buf, sizeof(buf)); printf("%s\n", buf); return true; }
-void uart_send_frame(const sensor_frame_t *f)
-{ char buf[160]; frame_to_json(f, buf, sizeof(buf)); printf("[UART] %s\n", buf); }
-
-static void delay_ms(int ms){ struct timespec ts={ms/1000,(ms%1000)*1000000}; nanosleep(&ts,0); }
+#ifdef _WIN32
+#include <windows.h>
+static void delay_ms(int ms) { Sleep((DWORD)ms); }
 #else
-#include "cmsis_os.h"   /* FreeRTOS / CMSIS 封装 */
+static void delay_ms(int ms) {
+    struct timespec delay = {ms / 1000, (ms % 1000) * 1000000L};
+    nanosleep(&delay, NULL);
+}
+#endif
+#else
+#include "cmsis_os.h"
+/* Board integrator must provide RTC/NTP-derived Unix milliseconds, NOT ticks. */
+extern int64_t device_unix_time_ms(void);
 #define delay_ms(ms) osDelay(ms)
 #endif
 
-/* 采样周期（ms），与模拟器 PUSH_INTERVAL 对齐 */
-#define SAMPLE_PERIOD_MS 1000
-
-static sensor_frame_t make_frame(float temp, float hum, float lux)
-{
-    sensor_frame_t f;
-    memset(&f, 0, sizeof(f));
-    strncpy(f.id, NODE_ID, sizeof(f.id) - 1);
-    strncpy(f.name, NODE_NAME, sizeof(f.name) - 1);
+static sensor_frame_t make_frame(float temp, float hum, float lux) {
+    sensor_frame_t frame = {0};
+    memcpy(frame.id, NODE_ID, sizeof(NODE_ID));
+    memcpy(frame.name, NODE_NAME, sizeof(NODE_NAME));
 #ifdef PC_BUILD
-    f.ts = (int64_t)time(NULL) * 1000;
+    static int64_t last = 0;
+    struct timespec now;
+    timespec_get(&now, TIME_UTC);
+    frame.ts = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+    if (frame.ts <= last) frame.ts = last + 1;
+    last = frame.ts;
 #else
-    f.ts = (int64_t)osKernelGetTickCount();   /* 真实板子用 RTC/系统节拍 */
+    frame.ts = device_unix_time_ms();
 #endif
-    f.temp = temp; f.hum = hum; f.lux = lux; f.anomaly = 0;
-    return f;
+    frame.temp = temp; frame.hum = hum; frame.lux = lux;
+    frame.anomaly = 0;
+    return frame;
 }
 
-static void sensor_task(void *arg)
-{
-    (void)arg;
+static int publish_sample(void) {
     float temp, hum, lux;
-    sensors_init();
-    mqtt_connect("YOUR_SSID", "YOUR_PSK", "broker.emqx.io", 1883);
-
-    for (;;) {
-        if (sensor_read_th(&temp, &hum) && sensor_read_lux(&lux)) {
-            sensor_frame_t f = make_frame(temp, hum, lux);
-            mqtt_publish_frame(&f);   /* 走 MQTT */
-            uart_send_frame(&f);      /* 同时打串口，便于调试 */
-        }
-        delay_ms(SAMPLE_PERIOD_MS);
-    }
+    if (!sensor_read_th(&temp, &hum) || !sensor_read_lux(&lux)) return 1;
+    sensor_frame_t frame = make_frame(temp, hum, lux);
+    if (!mqtt_publish_frame(&frame)) return 1;
+    uart_send_frame(&frame);
+    return 0;
 }
 
 #ifdef PC_BUILD
-int main(void)
-{
-    printf("=== iot-sensor-node firmware (PC build / 协议联调) ===\n");
-    sensor_task(NULL);
+int main(int argc, char **argv) {
+    long frames = 0; /* no arguments: continuous, 1 second between frames */
+    if (argc != 1) {
+        char *end;
+        if (argc != 3 || strcmp(argv[1], "--frames") != 0) return 2;
+        errno = 0;
+        frames = strtol(argv[2], &end, 10);
+        if (errno || *end || end == argv[2] || frames <= 0 || frames > 100000) return 2;
+    }
+    if (!sensors_init() || !mqtt_connect("", "", "", 0)) return 1;
+    for (long count = 0; frames == 0 || count < frames; ++count) {
+        if (publish_sample()) return 1;
+        if (frames == 0) delay_ms(1000);
+    }
     return 0;
 }
 #else
-int main(void)
-{
-    HAL_Init();
-    SystemClock_Config();
-    MX_GPIO_Init(); MX_I2C1_Init(); MX_USART2_UART_Init();
-    osKernelInitialize();
-    osThreadNew(sensor_task, NULL, NULL);
-    osKernelStart();
-    for (;;) {}
+static void sensor_task(void *arg) {
+    (void)arg;
+    sensors_init();
+    if (!mqtt_connect("YOUR_SSID", "YOUR_PSK", "YOUR_BROKER", 1883)) return;
+    for (;;) { publish_sample(); delay_ms(1000); }
 }
+/* HAL startup, pin mapping and RTOS creation belong in the board project. */
 #endif

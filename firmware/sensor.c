@@ -8,6 +8,7 @@
  */
 #include "sensor.h"
 #include <math.h>
+#include <stdlib.h>
 
 bool sensors_init(void)
 {
@@ -29,3 +30,4 @@ bool sensor_read_lux(float *lux)
     *lux = 420.0f + (float)((rand() % 100) / 100.0 - 0.5) * 30.0f;
     return true;
 }
+

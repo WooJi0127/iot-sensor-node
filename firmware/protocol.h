@@ -27,7 +27,12 @@ typedef struct {
     uint8_t  anomaly;     /* 异常标志（由边缘侧判定，固件默认 0） */
 } sensor_frame_t;
 
-/* 把帧序列化为 JSON 字符串（调用方提供缓冲区，>=128 字节） */
-void frame_to_json(const sensor_frame_t *f, char *buf, int buflen);
+/* UTF-8 fields must be terminated. ts is Unix milliseconds; anomaly is JSON boolean.
+ * Returns bytes excluding NUL, or -1 for invalid frame/insufficient buffer.
+ * On error a nonempty supplied buffer is cleared; caller must not publish it.
+ * 512 bytes accommodates all escaped fixed-capacity string fields and floats.
+ */
+int frame_to_json(const sensor_frame_t *f, char *buf, int buflen);
 
 #endif /* PROTOCOL_H */
+
